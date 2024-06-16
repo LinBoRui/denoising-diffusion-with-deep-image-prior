@@ -1,5 +1,6 @@
 from random import random
 import math
+from pathlib import Path
 from multiprocessing import cpu_count
 
 import torch
@@ -8,11 +9,19 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader
 from torchvision import utils
 
+from torch.optim import Adam
+
+from ema_pytorch import EMA
+
 from einops import rearrange, reduce
 
 from tqdm import tqdm
 
-from denoising_diffusion_pytorch import GaussianDiffusion, Trainer
+from accelerate import Accelerator
+
+from denoising_diffusion_pytorch import GaussianDiffusion
+from denoising_diffusion_pytorch.denoising_diffusion_pytorch import Dataset
+from denoising_diffusion_pytorch.fid_evaluation import FIDEvaluation
 
 from deep_image_prior.utils.denoising_utils import *
 
@@ -30,8 +39,11 @@ def divisible_by(numer, denom):
 
 def cycle(dl):
     while True:
-        for idx, data in enumerate(dl):
-            yield idx, data
+        for data in dl:
+            yield data
+
+def has_int_squareroot(num):
+    return (math.sqrt(num) ** 2) == num
 
 def num_to_groups(num, divisor):
     groups = num // divisor
@@ -225,7 +237,7 @@ class GaussianDiffusionWithDeepImagePrior(GaussianDiffusion):
         return self.p_losses(img, t, *args, **kwargs)
 
 
-class Trainer(Trainer):
+class Trainer:
     def __init__(
         self,
         diffusion_model,
@@ -255,73 +267,153 @@ class Trainer(Trainer):
         num_fid_samples = 50000,
         save_best_and_latest_only = False
     ):
-        super().__init__(
-            diffusion_model,
-            folder,
-            train_batch_size = train_batch_size,
-            gradient_accumulate_every = gradient_accumulate_every,
-            augment_horizontal_flip = augment_horizontal_flip,
-            train_lr = train_lr,
-            train_num_steps = train_num_steps,
-            ema_update_every = ema_update_every,
-            ema_decay = ema_decay,
-            adam_betas = adam_betas,
-            save_and_sample_every = save_and_sample_every,
-            num_samples = num_samples,
-            results_folder = results_folder,
-            amp = amp,
-            mixed_precision_type = mixed_precision_type,
+        # accelerator
+
+        self.accelerator = Accelerator(
             split_batches = split_batches,
-            convert_image_to = convert_image_to,
-            calculate_fid = calculate_fid,
-            inception_block_idx = inception_block_idx,
-            max_grad_norm = max_grad_norm,
-            num_fid_samples = num_fid_samples,
-            save_best_and_latest_only = save_best_and_latest_only
+            mixed_precision = mixed_precision_type if amp else 'no'
         )
-        
+
+        # model
+
+        self.model = diffusion_model
+        self.channels = diffusion_model.channels
+        is_ddim_sampling = diffusion_model.is_ddim_sampling
+
+        # DIP model
+
         self.dip_model = dip_model
         self.dip_input_depth = dip_input_depth
         self.dip_steps = dip_steps
-        self.dip_folder = self.results_folder / 'dip'
+        self.dip_folder = os.path.join(results_folder, 'dip')
         
+        # default convert_image_to depending on channels
+
+        if not exists(convert_image_to):
+            convert_image_to = {1: 'L', 3: 'RGB', 4: 'RGBA'}.get(self.channels)
+
+        # sampling and training hyperparameters
+
+        assert has_int_squareroot(num_samples), 'number of samples must have an integer square root'
+        self.num_samples = num_samples
+        self.save_and_sample_every = save_and_sample_every
+
+        self.batch_size = train_batch_size
+        self.gradient_accumulate_every = gradient_accumulate_every
+        assert (train_batch_size * gradient_accumulate_every) >= 16, f'your effective batch size (train_batch_size x gradient_accumulate_every) should be at least 16 or above'
+
+        self.train_num_steps = train_num_steps
+        self.image_size = diffusion_model.image_size
+
+        self.max_grad_norm = max_grad_norm
+
+        # dataset and dataloader and generate noise
+
+        self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+
+        assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
+
         dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = False, pin_memory = True, num_workers = cpu_count())
-        dl = self.accelerator.prepare(dl)
-        self.dl = cycle(dl)
 
-        self.noise = torch.tensor([], device=self.accelerator.device)
+        noises = torch.tensor([], device = self.accelerator.device)
         for idx, data in tqdm(enumerate(dl), desc='generating noise'):
-            noise = self.get_noise(idx, data).unsqueeze(0)
-            self.noise = torch.cat((self.noise, noise), dim = 0)
+            noise = self.get_noise(data, idx).unsqueeze(0).to(self.accelerator.device)
+            noises = torch.cat((noises, noise), dim = 0)
+        
+        noises = self.accelerator.prepare(noises)
+        
+        dl = self.accelerator.prepare(dl)
+        
+        self.dl = cycle(dl)
+        self.batch = cycle(zip(dl, noises))
 
-    def generate_noise(self, data):
-        noise = torch.tensor([], device=self.accelerator.device)
-        for d in tqdm(data, leave=False):
-            d = d.unsqueeze(0)
-            dip_trainer = DIPTrainer(
-                model = self.dip_model,
-                dip_input_depth = self.dip_input_depth,
-                train_img = d,
-                results_folder = self.dip_folder,
-                device = self.accelerator.device
+        # optimizer
+
+        self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
+
+        # for logging results in a folder periodically
+
+        if self.accelerator.is_main_process:
+            self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
+            self.ema.to(self.device)
+
+        self.results_folder = Path(results_folder)
+        self.results_folder.mkdir(exist_ok = True)
+
+        # step counter state
+
+        self.step = 0
+
+        # prepare model, dataloader, optimizer with accelerator
+
+        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+
+        # FID-score computation
+
+        self.calculate_fid = calculate_fid and self.accelerator.is_main_process
+
+        if self.calculate_fid:
+            if not is_ddim_sampling:
+                self.accelerator.print(
+                    "WARNING: Robust FID computation requires a lot of generated samples and can therefore be very time consuming."\
+                    "Consider using DDIM sampling to save time."
+                )
+            self.fid_scorer = FIDEvaluation(
+                batch_size=self.batch_size,
+                dl=self.dl,
+                sampler=self.ema.ema_model,
+                channels=self.channels,
+                accelerator=self.accelerator,
+                stats_dir=results_folder,
+                device=self.device,
+                num_fid_samples=num_fid_samples,
+                inception_block_idx=inception_block_idx
             )
-            dip_trainer.train(train_num_steps = self.dip_steps)
-            noise = torch.cat((noise, dip_trainer.generate_noise()), dim = 0)
-        return noise.clone()
-    
-    def get_noise(self, idx, data):
-        noise_path = self.dip_folder / f'noise_{idx}.pth'
-        if noise_path.exists():
-            return torch.load(noise_path)
-        noise = self.generate_noise(data)
-        torch.save(noise, noise_path)
-        return noise
+
+        if save_best_and_latest_only:
+            assert calculate_fid, "`calculate_fid` must be True to provide a means for model evaluation for `save_best_and_latest_only`."
+            self.best_fid = 1e10 # infinite
+
+        self.save_best_and_latest_only = save_best_and_latest_only
+
+    @property
+    def device(self):
+        return self.accelerator.device
+
+    def save(self, milestone):
+        if not self.accelerator.is_local_main_process:
+            return
+
+        data = {
+            'step': self.step,
+            'model': self.accelerator.get_state_dict(self.model),
+            'opt': self.opt.state_dict(),
+            'ema': self.ema.state_dict(),
+            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None
+        }
+
+        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+
+    def load(self, milestone):
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device)
+
+        model = self.accelerator.unwrap_model(self.model)
+        model.load_state_dict(data['model'])
+
+        self.step = data['step']
+        self.opt.load_state_dict(data['opt'])
+        if self.accelerator.is_main_process:
+            self.ema.load_state_dict(data["ema"])
+
+        if exists(self.accelerator.scaler) and exists(data['scaler']):
+            self.accelerator.scaler.load_state_dict(data['scaler'])
 
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
-        
-        self.noise = self.noise.to(device)
 
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
 
@@ -330,9 +422,9 @@ class Trainer(Trainer):
                 total_loss = 0.
 
                 for _ in range(self.gradient_accumulate_every):
-                    idx, data = next(self.dl)
+                    data, noise = next(self.batch)
                     data = data.to(device)
-                    noise = self.noise[idx]
+                    noise = noise.to(device)
 
                     with self.accelerator.autocast():
                         loss = self.model(data, noise = noise)
@@ -383,6 +475,27 @@ class Trainer(Trainer):
                 pbar.update(1)
 
         accelerator.print('training complete')
+
+    def generate_noise(self, data):
+        noise = torch.tensor([], device=self.accelerator.device)
+        for d in tqdm(data, leave=False):
+            dip_trainer = DIPTrainer(
+                model = self.dip_model,
+                dip_input_depth = self.dip_input_depth,
+                train_img = d.unsqueeze(0),
+                results_folder = str(self.dip_folder)
+            )
+            dip_trainer.train(train_num_steps = self.dip_steps)
+            noise = torch.cat((noise, dip_trainer.generate_noise()), dim = 0)
+        return noise.detach()
+    
+    def get_noise(self, data, idx):
+        noise_path = os.path.join(self.dip_folder, f'noise_{idx}.pth')
+        if os.path.exists(noise_path):
+            return torch.load(noise_path)
+        noise = self.generate_noise(data)
+        torch.save(noise, noise_path)
+        return noise
 
 
 
@@ -462,7 +575,7 @@ class DIPTrainer:
     def generate_noise(self):
         out = self.predict()
         noise = normalize_norm_dist(out - self.train_img)
-        return noise
+        return noise.detach()
     
     def show_noise(self):
         noise = self.generate_noise()
