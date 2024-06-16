@@ -1,0 +1,30 @@
+[tool.poetry]
+name = "denoising-diffusion-with-deep-image-prior-initial"
+version = "0.1.0"
+description = ""
+authors = ["LinBoRui <linborui28@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+torch = {version = "^2.3.1+cu121", source = "pytorch-cu121"}
+torchvision = {version = "^0.18.1+cu121", source = "pytorch-cu121"}
+torchaudio = {version = "^2.3.1+cu121", source = "pytorch-cu121"}
+denoising-diffusion-pytorch = "^2.0.6"
+transformers = "^4.41.2"
+matplotlib = "^3.9.0"
+scikit-image = "^0.23.2"
+
+
+[[tool.poetry.source]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+priority = "supplemental"
+
+
+[tool.poetry.group.dev.dependencies]
+ipykernel = "^6.29.4"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
