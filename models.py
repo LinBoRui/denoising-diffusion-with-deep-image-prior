@@ -123,15 +123,14 @@ class GaussianDiffusionWithDeepImagePrior(GaussianDiffusion):
         
         self.dip_model = dip_model.type(torch.FloatTensor)
         self.dip_input_depth = dip_input_depth
-        
+        self.dip_input = get_noise(self.dip_input_depth, 'noise', self.image_size)
+
     @torch.inference_mode()
     def p_sample_loop(self, shape, return_all_timesteps = False):
         batch, device = shape[0], self.device
 
-        dip_input = get_noise(self.dip_input_depth, 'noise', shape[-2:]).to(device)
-        dip_input = dip_input.expand(batch, -1, -1, -1)
-        img = self.dip_model(dip_input)
-        img = standardizing(img)
+        img = self.dip_model(self.dip_input)
+        img = standardizing(img).expand(batch, -1, -1, -1)
         imgs = [img]
 
         x_start = None
@@ -154,10 +153,8 @@ class GaussianDiffusionWithDeepImagePrior(GaussianDiffusion):
         times = list(reversed(times.int().tolist()))
         time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
-        dip_input = get_noise(self.dip_input_depth, 'noise', shape[-2:]).to(device)
-        dip_input = dip_input.expand(batch, -1, -1, -1)
-        img = self.dip_model(dip_input)
-        img = standardizing(img)
+        img = self.dip_model(self.dip_input)
+        img = standardizing(img).expand(batch, -1, -1, -1)
         imgs = [img]
 
         x_start = None
@@ -200,11 +197,8 @@ class GaussianDiffusionWithDeepImagePrior(GaussianDiffusion):
     def p_losses(self, x_start, t, noise = None, offset_noise_strength = None):
         b, c, h, w = x_start.shape
         
-        dip_input = get_noise(self.dip_input_depth, 'noise', (h, w)).to(self.device)
-        dip_input = dip_input.expand(b, -1, -1, -1)
-        
-        dip_out = self.dip_model(dip_input)
-        
+        dip_out = self.dip_model(self.dip_input).expand(b, -1, -1, -1)
+
         noise = default(noise, lambda: standardizing(dip_out - x_start))
 
         # offset noise - https://www.crosslabs.org/blog/diffusion-with-offset-noise
