@@ -7,7 +7,8 @@ from models import GaussianDiffusionWithDeepImagePrior
 
 if __name__ == '__main__':
     
-    dataset_path = '/path/to/dataset'
+    set_name = 'airplane'
+    dataset_path = f'./datasets/cifar10/train/{set_name}'
 
     dip_input_depth = 32
     dip_model = get_net(input_depth = dip_input_depth,

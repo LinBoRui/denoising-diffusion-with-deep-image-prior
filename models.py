@@ -506,9 +506,8 @@ class DIPTrainer:
     
     def show_noise(self):
         noise = self.generate_noise()
-        noise = (noise + 1) / 2
+        noise = (noise - noise.min()) / (noise.max() - noise.min())
         noise_np = torch_to_np(noise)
-        noise_np = np.clip(noise_np, 0, 1)
         plot_image_grid([noise_np], factor = 13)
     
     def train(self, train_num_steps = 10000, predict_every = 10000, save_every = 10000):

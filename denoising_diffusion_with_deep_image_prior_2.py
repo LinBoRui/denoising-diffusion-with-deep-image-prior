@@ -7,7 +7,8 @@ from models import Trainer, generate_noise
 
 if __name__ == '__main__':
     
-    dataset_path = '/path/to/dataset'
+    set_name = 'airplane'
+    dataset_path = f'./datasets/cifar10/train/{set_name}'
     noise_path = f'{dataset_path}/noise'
 
     dip_input_depth = 32
