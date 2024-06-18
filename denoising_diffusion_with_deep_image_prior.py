@@ -2,12 +2,13 @@ from denoising_diffusion_pytorch import Unet, GaussianDiffusion
 
 from deep_image_prior.models import get_net
 
-from models import Trainer, DIPTrainer
+from models import Trainer, generate_noise
 
 
 if __name__ == '__main__':
     
     dataset_path = '/path/to/dataset'
+    noise_path = f'{dataset_path}/noise'
 
     dip_input_depth = 32
     dip_model = get_net(input_depth = dip_input_depth,
@@ -39,6 +40,7 @@ if __name__ == '__main__':
         diffusion,
         dataset_path,
         noise_path,
+        noise_alpha = 0.5,
         train_batch_size = 50,
         train_lr = 8e-5,
         train_num_steps = 10000,          # total training steps

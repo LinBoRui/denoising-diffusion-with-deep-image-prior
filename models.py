@@ -1,7 +1,6 @@
 from random import random
 import math
 from pathlib import Path
-from functools import partial
 from multiprocessing import cpu_count
 
 import torch
@@ -12,17 +11,12 @@ from torchvision import utils, transforms as T
 
 from torch.optim import Adam
 
-from ema_pytorch import EMA
-
 from einops import rearrange, reduce
 
 from tqdm import tqdm
 
-from accelerate import Accelerator
-
 from denoising_diffusion_pytorch import GaussianDiffusion, Trainer
 from denoising_diffusion_pytorch.denoising_diffusion_pytorch import Dataset
-from denoising_diffusion_pytorch.fid_evaluation import FIDEvaluation
 
 from deep_image_prior.utils.denoising_utils import *
 
@@ -64,7 +58,7 @@ def extract(a, t, x_shape):
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
-def normalize_norm_dist(x):
+def standardizing(x):
     return (x - torch.mean(x)) / torch.std(x)
 
 def collate_fn(batch):
@@ -137,7 +131,7 @@ class GaussianDiffusionWithDeepImagePrior(GaussianDiffusion):
         dip_input = get_noise(self.dip_input_depth, 'noise', shape[-2:]).to(device)
         dip_input = dip_input.expand(batch, -1, -1, -1)
         img = self.dip_model(dip_input)
-        img = normalize_norm_dist(img)
+        img = standardizing(img)
         imgs = [img]
 
         x_start = None
@@ -163,7 +157,7 @@ class GaussianDiffusionWithDeepImagePrior(GaussianDiffusion):
         dip_input = get_noise(self.dip_input_depth, 'noise', shape[-2:]).to(device)
         dip_input = dip_input.expand(batch, -1, -1, -1)
         img = self.dip_model(dip_input)
-        img = normalize_norm_dist(img)
+        img = standardizing(img)
         imgs = [img]
 
         x_start = None
@@ -211,7 +205,7 @@ class GaussianDiffusionWithDeepImagePrior(GaussianDiffusion):
         
         dip_out = self.dip_model(dip_input)
         
-        noise = default(noise, lambda: normalize_norm_dist(dip_out - x_start))
+        noise = default(noise, lambda: standardizing(dip_out - x_start))
 
         # offset noise - https://www.crosslabs.org/blog/diffusion-with-offset-noise
 
@@ -292,9 +286,11 @@ class DatasetwithNoise(Dataset):
     def __getitem__(self, index):
         path = self.paths[index]
         img = Image.open(path)
+        data = self.transform(img)
         noise_path = os.path.join(self.noise_folder, f'{path.stem}.pth')
         noise = torch.load(noise_path)
-        return self.transform(img), noise
+        assert data.shape == noise.shape, 'data and noise must have the same shape'
+        return data, noise
 
 
 class Trainer(Trainer):
@@ -304,6 +300,7 @@ class Trainer(Trainer):
         folder,
         noise_folder,
         *,
+        noise_alpha = 0.5,
         train_batch_size = 16,
         gradient_accumulate_every = 1,
         augment_horizontal_flip = True,
@@ -349,6 +346,10 @@ class Trainer(Trainer):
             num_fid_samples = num_fid_samples,
             save_best_and_latest_only = save_best_and_latest_only
         )
+        
+        assert noise_alpha >= 0 and noise_alpha <= 1, 'noise_alpha must be between 0 and 1'
+        
+        self.noise_alpha = noise_alpha
 
         self.ds_noise = DatasetwithNoise(folder, noise_folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
         
@@ -372,8 +373,10 @@ class Trainer(Trainer):
                     data, noise = next(self.dl_noise)
                     data = data.to(device)
                     noise = noise.to(device)
+                    randn = torch.randn_like(noise, device = device)
 
                     with self.accelerator.autocast():
+                        noise = standardizing(self.noise_alpha * noise + (1. - self.noise_alpha) * randn)
                         loss = self.model(data, noise = noise)
                         loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
@@ -500,11 +503,11 @@ class DIPTrainer:
     
     def generate_noise(self):
         out = self.predict()
-        noise = normalize_norm_dist(out - self.train_img)
+        noise = standardizing(out - self.train_img)
         return noise.detach()
     
     def save_noise(self, filename):
-        noise = self.generate_noise().detach().cpu()[0]
+        noise = self.generate_noise().cpu()[0]
         torch.save(noise, os.path.join(self.result_folder, filename))
     
     def show_noise(self):
