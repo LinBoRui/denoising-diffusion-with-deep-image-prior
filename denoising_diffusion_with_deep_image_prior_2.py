@@ -52,6 +52,3 @@ if __name__ == '__main__':
     )
 
     trainer.train()
-
-    # sampled_images = diffusion.sample(batch_size = 4)
-    # sampled_images.shape

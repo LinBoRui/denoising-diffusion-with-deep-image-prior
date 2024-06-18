@@ -121,7 +121,7 @@ class GaussianDiffusionWithDeepImagePrior(GaussianDiffusion):
             min_snr_gamma = min_snr_gamma
         )
         
-        self.dip_model = dip_model.type(torch.FloatTensor)
+        self.dip_model = dip_model
         self.dip_input_depth = dip_input_depth
         self.dip_input = get_noise(self.dip_input_depth, 'noise', self.image_size)
 
@@ -129,7 +129,7 @@ class GaussianDiffusionWithDeepImagePrior(GaussianDiffusion):
     def p_sample_loop(self, shape, return_all_timesteps = False):
         batch, device = shape[0], self.device
 
-        img = self.dip_model(self.dip_input)
+        img = self.dip_model(self.dip_input.to(self.device))
         img = standardizing(img).expand(batch, -1, -1, -1)
         imgs = [img]
 
@@ -153,7 +153,7 @@ class GaussianDiffusionWithDeepImagePrior(GaussianDiffusion):
         times = list(reversed(times.int().tolist()))
         time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
-        img = self.dip_model(self.dip_input)
+        img = self.dip_model(self.dip_input.to(self.device))
         img = standardizing(img).expand(batch, -1, -1, -1)
         imgs = [img]
 
@@ -197,7 +197,7 @@ class GaussianDiffusionWithDeepImagePrior(GaussianDiffusion):
     def p_losses(self, x_start, t, noise = None, offset_noise_strength = None):
         b, c, h, w = x_start.shape
         
-        dip_out = self.dip_model(self.dip_input).expand(b, -1, -1, -1)
+        dip_out = self.dip_model(self.dip_input.to(self.device)).expand(b, -1, -1, -1)
 
         noise = default(noise, lambda: standardizing(dip_out - x_start))
 
@@ -243,8 +243,8 @@ class GaussianDiffusionWithDeepImagePrior(GaussianDiffusion):
         loss = loss * extract(self.loss_weight, t, loss.shape)
         
         dip_loss = F.mse_loss(dip_out, x_start)
-        dip_loss = dip_loss.mean() * self.loss_weight[-1]
-        
+        dip_loss = dip_loss.mean() / b * self.loss_weight[-1]
+
         return loss.mean() + dip_loss
 
     def forward(self, img, *args, **kwargs):
